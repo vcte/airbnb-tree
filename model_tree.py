@@ -72,7 +72,7 @@ class Tree:
             return
 
         def fit_(x, y, depth = 1, used = []):
-            # model: [(ind, val, [model]), ...] | [(lbl)]
+            # model: [(ind, val, num, [model]), ...] | [(lbl)]
             model = []
 
             val = metric(y)
@@ -83,8 +83,10 @@ class Tree:
                (len(used) == len(x[0])) or \
                (val == 0):
                 f = flst(y)
-                lbl = max(f, key = lambda v: f[v])
-                return [(lbl, )]
+                for key in f:
+                    f[key] = f[key] / len(y)
+                #lbl = max(f, key = lambda v: f[v])
+                return len(y), [(f, )]
 
             # otherwise, construct a split node
             # first select best feature to split on
@@ -113,31 +115,44 @@ class Tree:
 
             # recursively fit the tree
             quiet or print(" " * depth + "split on: " + str(opt_ind))
+            tot = 0
             for feat in opt_lst:
                 x2 = [dat for dat, lbl in zip(x, y) if dat[opt_ind] == feat]
                 y2 = [lbl for dat, lbl in zip(x, y) if dat[opt_ind] == feat]
-                model_ = fit_(x2, y2, depth + 1, used + [opt_ind])
-                model.append((opt_ind, feat, model_))
-            return model
+                num, model_ = fit_(x2, y2, depth + 1, used + [opt_ind])
+                model.append((opt_ind, feat, num, model_))
+                tot += num
+            return tot, model
             
-        self.model = fit_(x, y)
+        _, self.model = fit_(x, y)
 
-    def predict(self, x):
+    def proba(self, x):
         # return single prediction for each input element
         def predict_(model, elem):
             if len(model) == 1 and len(model[0]) == 1:
                 return model[0][0]
             else:
-                for ind, val, m2 in model:
+                for ind, val, _, m2 in model:
                     if elem[ind] == val:
                         return predict_(m2, elem)
                 ind = model[0][0]
                 #print("no val found: " + str(ind) + " : " + str(elem[ind]))
-                return ""
+                m2 = sorted(model, key = lambda m: m[2], reverse = True)[0][3]
+                return predict_(m2, elem)
         
         predictions = []
         for elem in x:
             predictions.append(predict_(self.model, elem))
+        return predictions
+
+    def predict(self, x, k = 1):
+        prob = self.proba(x)
+        predictions = []
+        for votes in prob:
+            order = sorted(votes, key = lambda v: votes[v] \
+                           if v != "" else -1, reverse = True)
+            majority = order[: k]
+            predictions.append(majority)
         return predictions
 
     def display(self, head = None):
@@ -146,7 +161,7 @@ class Tree:
                 print(indent + str(model[0][0]))
             else:
                 m = sorted(model, key = lambda v: v[1])
-                for a, b, m2 in m:
+                for a, b, _, m2 in m:
                     s = str(a) if head is None else head[a]
                     print(indent + s + " = " + str(b))
                     display_(m2, indent + "  ")
@@ -158,7 +173,7 @@ class Forest:
         self.trees = None
 
     def fit(self, x, y, n_trees = 10, crit = "gini", max_depth = None,
-            min_split = 2, seed = 0, quiet = True):
+            min_split = 2, sample = 0.5, seed = 0, quiet = True):
         # list of tree objects
         self.trees = []
 
@@ -167,8 +182,8 @@ class Forest:
         random.seed(seed)
         for i in range(n_trees):
             random.shuffle(data)
-            x_ = [d[: -1] for d in data[: n // 100]]
-            y_ = [d[-1] for d in data[: n // 100]]
+            x_ = [d[: -1] for d in data[: int(n * sample)]]
+            y_ = [d[-1] for d in data[: int(n * sample)]]
             t = Tree()
             t.fit(x_, y_, crit = crit, max_depth = max_depth,
                   min_split = min_split, quiet = quiet)
@@ -180,8 +195,9 @@ class Forest:
         for elem in x:
             votes = {}
             for tree in self.trees:
-                pred = tree.predict([elem])[0]
-                votes[pred] = votes.get(pred, 0) + 1
+                prob = tree.proba([elem])[0]
+                for p in prob:
+                    votes[p] = votes.get(p, 0) + prob[p]
             order = sorted(votes, key = lambda v: votes[v] \
                            if v != "" else -1, reverse = True)
             majority = order[: k]
@@ -200,14 +216,14 @@ class AdaBoost:
         self.alphas = []
 
         # initialize weights as uniform distribution
-        global w, e, a, z, p, r
+        global w, e, a, z, p, r, t
         n = len(x)
         w = [1 / n for i in range(n)]
         data = np.array([x[i] + [y[i]] for i in range(n)])
         np.random.seed(seed)
         for i in range(n_trees):
             print("tree: " + str(i))
-            idx = np.random.choice(n, n * sample, replace = False, p = w)
+            idx = np.random.choice(n, int(n * sample), replace = False, p = w)
             data_ = data[idx]
             x_ = [d[: -1] for d in data_]
             y_ = [d[-1] for d in data_]
@@ -217,7 +233,8 @@ class AdaBoost:
             self.trees.append(t)
 
             # find weighted error sum
-            p = [1 if yi == t.predict([xi])[0] else -1 for xi, yi in zip(x, y)]
+            p = [1 if [yi] == t.predict([xi])[0] else -1
+                 for xi, yi in zip(x, y)]
             r = sum([wi for pi, wi in zip(p, w) if pi == -1])
             a = 1/2 * log((1 - r) / r)
             self.alphas.append(a)
@@ -226,23 +243,35 @@ class AdaBoost:
             z = sum([wi * (e ** (-a * pi)) for pi, wi in zip(p, w)])
             w = [wi / z * (e ** (-a * pi)) for pi, wi in zip(p, w)]
 
+##            if val_x is not None and val_y is not None:
+##                pred = self.predict(val_x, k = 5)
+##                n_correct = sum([int(p[0] == y) for p, y in zip(pred, val_y)])
+##                print(" val accuracy: " + str(round(n_correct / len(val_y), 3)))
+##                tot = 0
+##                for p, y in zip(pred, val_y):
+##                    dcg = sum([((2 ** (int(p[i] == y))) - 1) / (log(i + 2, 2))
+##                               for i in range(len(p))])
+##                    tot += dcg
+##                print(" avg dcg: " + str(round(tot / len(val_y), 5)))
+
     def predict(self, x, k = 1):
         # return list of predictions, in descending order
         predictions = []
         for i, elem in enumerate(x):
-            if i % (int(len(x) // 100) * 10) == 0:
-                print("pred: " + str(i))
+##            if i % (int(len(x) // 100) * 10) == 0:
+##                print("pred: " + str(i))
             votes = {}
             for tree, alpha in zip(self.trees, self.alphas):
-                pred = tree.predict([elem])[0]
-                votes[pred] = votes.get(pred, 0) + alpha
+                prob = tree.proba([elem])[0]
+                for p in prob:
+                    votes[p] = votes.get(p, 0) + alpha * prob[p]
             order = sorted(votes, key = lambda v: votes[v] \
                            if v != "" else -1, reverse = True)
             majority = order[: k]
             predictions.append(majority)
         return predictions
         
-def classify():
+def classify(validate = True):
     global head, x, y, tree, pred, forest
     
     print("reading training data")
@@ -270,36 +299,64 @@ def classify():
 
     y = [d[-1] for d in data]
     x = [proc(d) for d in data]
-    split = int(0.7 * len(x))
-    trn_x = x[: split]
-    trn_y = y[: split]
-    tst_x = x[split :]
-    tst_y = y[split :]
     head = head[4 : 14 + 1]
 
     print("fitting model")
-##    tree = Tree()
-##    tree.fit(trn_x, trn_y, crit = "gini", max_depth = 3, min_split = 8,
-##             quiet = True)
-##    forest = Forest()
-##    forest.fit(trn_x, trn_y, n_trees = 128, max_depth = 4, min_split = 6,
-##               quiet = True)
-    ada = AdaBoost()
-    ada.fit(trn_x, trn_y, n_trees = 32, max_depth = 3, min_split = 2,
-            sample = 0.5, seed = 1, quiet = True)
+    if validate:
+        split = int(0.7 * len(x))
+        trn_x = x[: split]
+        trn_y = y[: split]
+        tst_x = x[split :]
+        tst_y = y[split :]
 
-    #tree.display(head)
+    ##    tree = Tree()
+    ##    tree.fit(trn_x, trn_y, crit = "gini", max_depth = 3, min_split = 8,
+    ##             quiet = True)
+    ##    forest = Forest()
+    ##    forest.fit(trn_x, trn_y, n_trees = 128, max_depth = 4, min_split = 6,
+    ##               quiet = True)
+        ada = AdaBoost()
+        ada.fit(trn_x, trn_y, n_trees = 32, max_depth = 3, min_split = 2,
+                sample = 0.8, seed = 1, quiet = True)
+        clf = ada
 
-    print("evaluating model")
-    pred = ada.predict(tst_x, k = 5)
-    n_correct = sum([int(p == y) for p, y in zip(pred, tst_y)])
-    print(" accuracy: " + str(round(n_correct / len(tst_y), 3)))
-    tot = 0
-    for p, y in zip(pred, tst_y):
-        dcg = sum([((2 ** (int(p[i] == y))) - 1) / (log(i + 2, 2))
-                   for i in range(len(p))])
-        tot += dcg
-    print(" total dcg: " + str(round(tot, 5)))
-    print(" avg dcg: " + str(round(tot / len(tst_y), 5)))
+        #tree.display(head)
 
-    return ada
+        print("evaluating model")
+        pred = clf.predict(tst_x, k = 5)
+        n_correct = sum([int(p[0] == y) for p, y in zip(pred, tst_y)])
+        print(" accuracy: " + str(round(n_correct / len(tst_y), 3)))
+        tot = 0
+        for p, y in zip(pred, tst_y):
+            dcg = sum([((2 ** (int(p[i] == y))) - 1) / (log(i + 2, 2))
+                       for i in range(len(p))])
+            tot += dcg
+        print(" avg dcg: " + str(round(tot / len(tst_y), 5)))
+    else:
+##        split = int(0.85 * len(x))
+##        trn_x = x[: split]
+##        trn_y = y[: split]
+##        val_x = x[split :]
+##        val_y = y[split :]
+        
+##        ada = AdaBoost()
+##        ada.fit(x, y, n_trees = 32, max_depth = 3, min_split = 2,
+##                sample = 0.8, seed = 1, quiet = True)
+        forest = Forest()
+        forest.fit(x, y, n_trees = 32, max_depth = 3, min_split = 2,
+                   sample = 0.95, seed = 1, quiet = True)
+        clf = forest
+
+        print("writing predictions")
+        _, tst = read_csv("test_users.csv")
+        ids = [t[0] for t in tst]
+        tst = [proc(t) for t in tst]
+        pred = clf.predict(tst, k = 5)
+        with open("submission.csv", mode = "w") as f:
+            f.write("id,country\n")
+            for i, p in zip(ids, pred):
+                for dst in p:
+                    if dst != "":
+                        out = f.write(str(i) + "," + str(dst) + "\n")
+        
+    return clf
